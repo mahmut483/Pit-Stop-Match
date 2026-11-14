@@ -4,9 +4,11 @@
 import * as THREE from "three";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 import { buildRoom, PILE, MESS_PARTS, CLEANERS, ROOM } from "./room.js";
+import { fadeObject } from "./fade.js";
 import { ITEMS } from "./items.js";
 import { LEVELS } from "./levels.js";
 import { initPhysics, PileWorld, supportHull } from "./physics.js";
+import { popItem } from "./pop.js";
 import { hullPoints, boundsOf, getHighlightMat, D2R } from "./kit.js";
 import { GRIME, GRIME_CATS, setDirt, cleanCategory, updateGrime, grimeShared, isDirty } from "./grime.js";
 import { Tweens, Particles, Sound, Confetti, ease, ringTexture, glowTexture, screenSprite } from "./fx.js";
@@ -86,6 +88,8 @@ let vibrate = store.get("vibrate", true);
 let timeScale = 1;
 
 const room = buildRoom();
+// the shop is black and white so the colourful items to collect (and the ones put back) stand out
+fadeObject(room.root);
 scene.add(room.root);
 
 // ── Eşya prototipleri ───────────────────────────────────────────────────────────────────
@@ -96,7 +100,11 @@ function proto(type) {
   const def = ITEMS[type];
   if (!def) throw new Error("unknown item type: " + type);
   const model = def.build().build();
-  model.scale.setScalar(ITEM_SCALE);
+  // every item a bit bigger, small ones more (tea glass ≈ +40%, tyre/mop ≈ +10%)
+  model.updateMatrixWorld(true);
+  const raw = boundsOf(model).radius;
+  const grow = 1.1 + 0.3 * Math.min(1, Math.max(0, (0.6 - raw) / 0.36));
+  model.scale.setScalar(ITEM_SCALE * grow);
   model.updateMatrixWorld(true);
   const b = boundsOf(model);
   const wrap = new THREE.Group();
@@ -119,7 +127,7 @@ function proto(type) {
 const S = {
   levelIndex: 0, level: null, phase: "loading",
   items: [], tray: [], history: [], decor: new Map(), resolvers: [],
-  placed: 0, total: 0, counts: { undo: 0, hint: 0, shuffle: 0 },
+  placed: 0, total: 0,
   physics: null, dropQueue: [], dropT: 0, rng: Math.random,
   combo: 0, lastMatch: -10, startTime: 0, now: 0, spawned: 0,
 };
@@ -142,7 +150,6 @@ const wrapDeg = (a) => ((((a + 180) % 360) + 360) % 360) - 180;
 const _v = new THREE.Vector3(), _v2 = new THREE.Vector3(), _q1 = new THREE.Quaternion(), _q2 = new THREE.Quaternion();
 const _shakePan = new THREE.Vector2();
 const view = { w: 1, h: 1, availTop: 0, availBot: 1, shift: 0 };
-const homeBtn = $("#home-btn");
 
 function placeCamera(az, el, dist, target, pan) {
   const a = az * D2R, e = el * D2R;
@@ -214,8 +221,6 @@ function updateCamera(dt) {
   }
   placeCamera(cam.az, cam.el, cam.dist / cam.zoom, cam.target, pan);
   updateWalls();
-  const off = Math.abs(wrapDeg(cam.tAz - cam.baseAz)) > 4 || Math.abs(cam.tEl - cam.baseEl) > 4 || Math.abs(cam.tZoom - 1) > 0.06;
-  if (homeBtn.hidden === off) homeBtn.hidden = !off;
 }
 // back to the first view the short way round (the azimuth is not wrapped while turning)
 function resetCamera() {
@@ -255,9 +260,9 @@ function measure() {
   view.w = Math.max(1, gr.width);
   view.h = Math.max(1, gr.height);
   const prog = $(".progress").getBoundingClientRect();
-  const hint = $(".rotate-hint").getBoundingClientRect();
+  const tray = $("#tray-frame").getBoundingClientRect();
   view.availTop = prog.bottom - gr.top + 6;
-  view.availBot = hint.top - gr.top - 2;
+  view.availBot = tray.top - gr.top - 12;
   slots = slotEls.map((s) => {
     const r = s.getBoundingClientRect();
     return { x: r.left - gr.left + r.width / 2, y: r.top - gr.top + r.height / 2, size: Math.min(r.width, r.height) };
@@ -280,7 +285,6 @@ function resize() {
   overlayFx.mat.uniforms.scale.value = dpr;
   confetti.mat.uniforms.scale.value = dpr;
   overlayDirty = true;
-  scheduleRef();
 }
 window.addEventListener("resize", () => requestAnimationFrame(resize));
 
@@ -333,6 +337,7 @@ function makeItem(type) {
   const m = P.model.clone();
   m.position.copy(P.center).negate();
   obj.add(m);
+  popItem(m);
   const item = { id: ++uid, type, obj, status: "pile", body: null, radius: P.radius, fly: null, punch: 0 };
   obj.traverse((o) => { if (o.isMesh) { o.userData.item = item; o.userData.baseMat = o.material; } });
   return item;
@@ -381,6 +386,8 @@ function buildDecor(type, visible) {
     }
     d.userData.baseScale = d.scale.clone();
     d.visible = visible;
+    // already on the shelf from the start = scenery (black and white); the ones the player puts back keep their colour
+    if (visible) fadeObject(d);
     const wall = h.wall || (h.parent && room.rigs[h.parent] && room.rigs[h.parent].obj.userData.wall);
     if (wall) setWallLayer(d, wall);
     list.push(d);
@@ -413,7 +420,6 @@ function loadLevel(index) {
   S.level = L;
   const seed = params.get("seed") ? Number(params.get("seed")) : L.seed;
   S.rng = mulberry32(seed);
-  S.counts = { undo: L.undo, hint: L.hint, shuffle: L.shuffle };
   S.placed = 0;
   S.total = L.types.length;
   S.combo = 0;
@@ -438,9 +444,6 @@ function loadLevel(index) {
   hideResult();
   startTutorial();
   updateHud(true);
-  $("#level-label").textContent = "LEVEL " + (index + 1);
-  $("#level-title").textContent = L.title;
-  replay($("#plate"), "flip");
   // giriş kamera hareketi: biraz uzaktan ve yandan süzülerek yerine oturur
   cam.tAz = cam.baseAz; cam.tEl = cam.baseEl; cam.tZoom = 1; cam.tPan.set(0, 0);
   cam.az = cam.baseAz - 14; cam.el = cam.baseEl + 6; cam.zoom = 0.86; cam.pan.set(0, 0);
@@ -452,8 +455,6 @@ function loadLevel(index) {
   }
   cam.rate = 2.4;
   setTimeout(() => (cam.rate = 12), 1600);
-  syncPanel();
-  scheduleRef();
   log("load", L.id);
 }
 
@@ -721,13 +722,12 @@ async function win() {
   overlayDirty = true;
   sound.win();
   sound.honk(0.75);
-  const used = (S.level.undo - S.counts.undo) + (S.level.hint - S.counts.hint) + (S.level.shuffle - S.counts.shuffle);
-  const stars = used === 0 ? 3 : used <= 2 ? 2 : 1;
+  const stars = 3;
   const best = store.get("stars", {});
   best[S.level.id] = Math.max(best[S.level.id] || 0, stars);
   store.set("stars", best);
   await tweens.wait(0.8);
-  showResult(true, { stars, elapsed, used });
+  showResult(true, { stars, elapsed });
   setTimeout(() => (cam.rate = 12), 2500);
 }
 
@@ -752,10 +752,10 @@ function showResult(won, info = {}) {
   $("#result-message").textContent = won
     ? (last ? "The shop is spotless. Every work order is done!" : "The shop is spotless, everything in its place.")
     : "Line up three of the same part before the tray fills up.";
-  const pri = $("#result-primary"), sec = $("#result-secondary");
+  const pri = $("#result-primary");
   pri.classList.toggle("breathe", won);
   if (won) {
-    $("#stats").innerHTML = `<span>Time ${fmtTime(info.elapsed || 0)}</span><span>${info.used ? "Help used: " + info.used : "No help!"}</span>`;
+    $("#stats").innerHTML = `<span>Time ${fmtTime(info.elapsed || 0)}</span>`;
     const stars = [...document.querySelectorAll("#stars svg")];
     stars.forEach((s) => s.classList.remove("in", "lit"));
     stars.forEach((s, i) => setTimeout(() => {
@@ -764,115 +764,15 @@ function showResult(won, info = {}) {
     }, 350 + i * 260));
     pri.textContent = last ? "Play again" : "Next level";
     pri.onclick = () => goLevel(last ? 0 : S.levelIndex + 1);
-    sec.hidden = true;
   } else {
     pri.textContent = "Try again";
     pri.onclick = () => goLevel(S.levelIndex);
-    sec.hidden = S.counts.undo <= 0;
-    sec.textContent = `Undo and keep going (${S.counts.undo})`;
-    sec.onclick = () => { hideResult(); S.phase = "play"; doUndo(); };
   }
 }
 function hideResult() { $("#result").hidden = true; }
 
-// ── Yardımcılar: geri al, büyüteç, karıştır ─────────────────────────────────────────────
-function doUndo() {
-  if (S.phase !== "play" || S.counts.undo <= 0) { sound.deny(); return; }
-  let h = null;
-  for (let i = S.history.length - 1; i >= 0; i--) {
-    const it = S.history[i].item;
-    if (it.status === "tray") { h = S.history.splice(i, 1)[0]; break; }
-    if (it.status === "flying" || it.status === "matching") { sound.deny(); return; }
-  }
-  if (!h) { sound.deny(); replay($("#undo-button"), "shake"); return; }
-  const item = h.item;
-  S.counts.undo--;
-  replay($("#undo-button"), "used");
-  S.tray = S.tray.filter((x) => x !== item);
-  item.status = "returning";
-  const top = S.physics.topAt(h.pos.x, h.pos.z);
-  const wp = h.pos.clone();
-  wp.y = Math.max(wp.y, top + item.radius * 0.6);
-  const sp = worldToScreen(wp);
-  const s1 = pxPerUnitAt(wp);
-  const q1 = camera.quaternion.clone().invert().multiply(h.quat);
-  const p0 = item.obj.position.clone(), q0 = item.obj.quaternion.clone(), s0 = item.obj.scale.x;
-  const p1 = new THREE.Vector3(sp.x, -sp.y, 200);
-  sound.undo();
-  tweens.add({
-    dur: 0.4, ease: ease.inOutCubic,
-    update: (e, k) => {
-      item.obj.position.lerpVectors(p0, p1, e);
-      item.obj.position.y += Math.sin(Math.PI * k) * 70;
-      item.obj.quaternion.slerpQuaternions(q0, q1, e);
-      item.obj.scale.setScalar(s0 + (s1 - s0) * e);
-    },
-  }).then(() => {
-    overlay.remove(item.obj);
-    scene.add(item.obj);
-    item.obj.position.copy(wp);
-    item.obj.quaternion.copy(h.quat);
-    item.obj.scale.setScalar(1);
-    S.physics.addItem(item, proto(item.type).shape, wp, h.quat);
-    item.status = "pile";
-    item.slept = false;
-    worldFx.burst(wp, 8, { color: "#ffffff", speed: 1.2, size: 0.2, life: 0.4, gravity: 0 });
-    updateHud();
-  });
-  updateHud();
-}
-
 function pileItems() { return S.items.filter((it) => it.status === "pile"); }
 function topFirst(list) { return list.slice().sort((a, b) => b.obj.position.y - a.obj.position.y); }
-
-function doHint() {
-  if (S.phase !== "play" || S.counts.hint <= 0) { sound.deny(); return; }
-  const free = SLOTS - S.tray.length;
-  const pile = pileItems();
-  const inTray = new Map();
-  for (const it of S.tray) if (it.status !== "matching") inTray.set(it.type, (inTray.get(it.type) || 0) + 1);
-  const options = [];
-  for (const type of new Set(pile.map((p) => p.type))) {
-    const have = inTray.get(type) || 0;
-    const need = 3 - have;
-    const avail = pile.filter((p) => p.type === type).length;
-    if (need <= free && avail >= need) options.push({ type, need, have });
-  }
-  if (!options.length) { sound.deny(); replay($("#hint-button"), "shake"); return; }
-  options.sort((a, b) => b.have - a.have || a.need - b.need);
-  const { type, need } = options[0];
-  const picks = topFirst(pile.filter((p) => p.type === type)).slice(0, need);
-  S.counts.hint--;
-  replay($("#hint-button"), "used");
-  sound.hint();
-  picks.forEach((it, i) => {
-    setHighlight(it, true);
-    const sp = worldToScreen(it.obj.position);
-    ringAt(sp.x, -sp.y, { color: "#bfe8ff", from: 90, to: 20, dur: 0.35 });
-    worldFx.burst(it.obj.position, 12, { color: "#bfe8ff", speed: 2, size: 0.25, life: 0.5, gravity: 0 });
-    setTimeout(() => pickItem(it, { fast: true }), 260 + i * 160);
-  });
-  updateHud();
-}
-
-function doShuffle() {
-  if (S.phase !== "play" || S.counts.shuffle <= 0) { sound.deny(); return; }
-  S.counts.shuffle--;
-  replay($("#shuffle-button"), "used");
-  sound.shuffle();
-  cam.shake = 0.35;
-  const cx = (PILE.x0 + PILE.x1) / 2, cz = (PILE.z0 + PILE.z1) / 2;
-  for (const it of pileItems()) {
-    const p = it.body.translation();
-    const r = () => Math.random() * 2 - 1;
-    it.body.wakeUp();
-    it.still = 0;
-    it.body.setLinvel({ x: (cx - p.x) * 0.4 + r() * 1.6, y: 5.5 + Math.random() * 3.5, z: (cz - p.z) * 0.4 + r() * 1.6 }, true);
-    it.body.setAngvel({ x: r() * 7, y: r() * 7, z: r() * 7 }, true);
-  }
-  worldFx.burst(new THREE.Vector3(cx, 0.4, cz), 34, { palette: ["#ffffff", "#e8dcc6"], speed: 4, size: 0.38, life: 0.85, gravity: 0.5, spread: 2.5, drag: 2.5 });
-  updateHud();
-}
 
 // ── Arayüz ──────────────────────────────────────────────────────────────────────────────
 const ICON_WRENCH = `<svg viewBox="0 0 24 24"><path fill="currentColor" d="M21.7 6.6a1 1 0 0 0-1.6-.3l-2.6 2.6-2.1-.5-.5-2.1 2.6-2.6a1 1 0 0 0-.3-1.6A6 6 0 0 0 9.4 9.6l-6.5 6.5a2.6 2.6 0 0 0 3.7 3.7l6.5-6.5a6 6 0 0 0 8.6-6.7Z"/></svg>`;
@@ -888,20 +788,11 @@ function replay(el, cls) {
   el.classList.add(cls);
 }
 
-let lastCounts = {};
 let warned = false;
-function updateHud(reset = false) {
+function updateHud() {
   const pct = S.total ? (S.placed / S.total) * 100 : 0;
   $("#progress-fill").style.width = pct + "%";
   $("#progress-caption").textContent = `${S.placed} / ${S.total}`;
-  for (const k of ["undo", "hint", "shuffle"]) {
-    const el = $(`#${k}-count`);
-    if (!reset && lastCounts[k] !== undefined && lastCounts[k] !== S.counts[k]) replay(el, "pop");
-    el.textContent = S.counts[k];
-    lastCounts[k] = S.counts[k];
-    $(`#${k}-button`).classList.toggle("empty", S.counts[k] <= 0);
-  }
-  $("#undo-button").classList.toggle("idle", !S.history.some((h) => h.item.status === "tray"));
   const n = S.tray.length;
   const frame = $("#tray-frame");
   frame.classList.toggle("warn", n === 5);
@@ -916,12 +807,6 @@ function showCombo(n) {
   sound.sparkle();
 }
 
-let rotateHintShown = true;
-function hideRotateHint() {
-  if (!rotateHintShown) return;
-  rotateHintShown = false;
-  $(".rotate-hint").classList.add("faded");
-}
 
 // İlk seviyede yol gösteren el: üstteki eşyayı işaret eder
 let tutorial = null;
@@ -947,27 +832,12 @@ function updateTutorial() {
   el.style.transform = `translate(${p.x}px, ${p.y}px)`;
 }
 
-// Bölüm listesi (geri düğmesi)
-function openLevels() {
-  const body = $("#sheet-body");
-  const stars = store.get("stars", {});
-  body.innerHTML = LEVELS.map((L, i) => `
-    <button class="level-row${i === S.levelIndex ? " current" : ""}" data-level="${i}">
-      <span class="num">${i + 1}</span>
-      <span class="txt"><b>${L.title}</b><small>${L.types.length} parts · ${L.types.length * 3} items${L.dirt.length ? " · dirty" : ""}</small></span>
-      <span class="tick">${"★".repeat(stars[L.id] || 0)}</span>
-    </button>`).join("");
-  body.querySelectorAll("[data-level]").forEach((b) => (b.onclick = () => { $("#sheet").hidden = true; goLevel(Number(b.dataset.level)); }));
-  $("#sheet").hidden = false;
-}
-
 // Bölüm geçişi: kepenk iner, bölüm kurulur, kepenk kalkar
 let transitioning = false;
 async function goLevel(i) {
   if (transitioning) return;
   transitioning = true;
   hideResult();
-  $("#sheet").hidden = true;
   const L = $("#loading");
   $("#loading-message").textContent = `Level ${i + 1} · ${LEVELS[i].title}`;
   L.classList.add("open");
@@ -985,149 +855,11 @@ async function goLevel(i) {
   transitioning = false;
 }
 
-$("#back-btn").onclick = () => { sound.unlock(); openLevels(); };
-$("#sheet-close").onclick = () => ($("#sheet").hidden = true);
-$("#sheet").addEventListener("click", (e) => { if (e.target.id === "sheet") $("#sheet").hidden = true; });
-homeBtn.onclick = resetCamera;
-$("#undo-button").onclick = () => { sound.unlock(); doUndo(); };
-$("#hint-button").onclick = () => { sound.unlock(); doHint(); };
-$("#shuffle-button").onclick = () => { sound.unlock(); doShuffle(); };
 
-// ── Ayarlar paneli (referanstaki düzen) ─────────────────────────────────────────────────
-const panel = $("#panel");
-function openPanel() {
-  panel.hidden = false;
-  panel.classList.remove("out");
-  replay(panel, "in");
-  $("#gear-btn").classList.add("on");
-  syncPanel();
-  $("#p-state").textContent = stateText();
-}
-function closePanel() {
-  if (panel.hidden) return;
-  panel.classList.remove("in");
-  panel.classList.add("out");
-  $("#gear-btn").classList.remove("on");
-  setTimeout(() => { if (panel.classList.contains("out")) panel.hidden = true; }, 220);
-}
-function togglePanel() { if (panel.hidden || panel.classList.contains("out")) openPanel(); else closePanel(); }
-$("#gear-btn").onclick = () => { sound.unlock(); togglePanel(); };
-$("#panel-close").onclick = closePanel;
-
-const levelSel = $("#p-level");
-levelSel.innerHTML = LEVELS.map((L, i) => `<option value="${i}">${i + 1}. ${L.title} — ${L.types.length} types, ${L.types.length * 3} items</option>`).join("");
-levelSel.onchange = () => goLevel(Number(levelSel.value));
-$("#p-restart").onclick = () => goLevel(S.levelIndex);
-$("#p-next").onclick = () => goLevel((S.levelIndex + 1) % LEVELS.length);
-
-function setRange(id, value, fmt = (v) => v) {
-  const el = $("#" + id);
-  el.value = value;
-  const min = Number(el.min), max = Number(el.max);
-  el.style.setProperty("--p", ((Number(el.value) - min) / (max - min)) * 100 + "%");
-  const out = $("#o-" + id.slice(2));
-  if (out) out.textContent = fmt(Number(el.value));
-}
-function bindRange(id, onInput, fmt) {
-  const el = $("#" + id);
-  el.addEventListener("input", () => { setRange(id, el.value, fmt); onInput(Number(el.value)); });
-}
-const f2 = (v) => v.toFixed(2), f0 = (v) => String(Math.round(v * 10) / 10), fPct = (v) => Math.round(v * 100) + "%";
-bindRange("p-el", (v) => { cam.baseEl = v; fitCamera(); cam.tEl = v; cam.tPan.set(0, 0); scheduleRef(); }, f0);
-bindRange("p-az", (v) => { cam.baseAz = v; fitCamera(); cam.tAz = v; cam.tPan.set(0, 0); scheduleRef(); }, f0);
-bindRange("p-margin", (v) => { cam.margin = v; fitCamera(); scheduleRef(); }, (v) => v.toFixed(3));
-bindRange("p-zoom", (v) => { cam.tZoom = v; scheduleRef(); }, f2);
-bindRange("p-refop", (v) => { refImg.style.opacity = v; }, f2);
-bindRange("p-volume", (v) => { sound.setVolume(v); store.set("volume", v); }, fPct);
-for (const el of document.querySelectorAll("input.dirt")) {
-  bindRange(el.id, (v) => { const U = GRIME[el.dataset.cat]; U.anim = null; U.uDirt.value = v; U.uClean.value = -0.3; }, f2);
-}
-$("#p-home").onclick = resetCamera;
-
-function bindToggle(id, get, set) {
-  const el = $("#" + id);
-  el.onclick = () => { set(!get()); el.classList.toggle("on", get()); };
-  el.classList.toggle("on", get());
-}
-bindToggle("p-sound", () => sound.on, (v) => { sound.on = v; store.set("sound", v); sound.unlock(); });
-bindToggle("p-vibrate", () => vibrate, (v) => { vibrate = v; store.set("vibrate", v); });
-let showColliders = false, colliderLines = null;
-bindToggle("p-colliders", () => showColliders, (v) => { showColliders = v; if (!v && colliderLines) colliderLines.visible = false; });
-bindToggle("p-slowmo", () => timeScale < 1, (v) => { timeScale = v ? 0.3 : 1; });
-let fpsEl = null;
-bindToggle("p-fps", () => !!fpsEl, (v) => {
-  if (v && !fpsEl) { fpsEl = document.createElement("div"); fpsEl.className = "fps"; gameEl.append(fpsEl); }
-  if (!v && fpsEl) { fpsEl.remove(); fpsEl = null; }
-});
-if (params.get("fps") === "1") $("#p-fps").click();
-
-// Botlar
-let bot = null, botTimer = null;
-function setBot(mode) {
-  bot = bot === mode ? null : mode;
-  clearInterval(botTimer);
-  if (bot) botTimer = setInterval(() => (bot === "greedy" ? autoStep() : randomStep()), 480);
-  $("#p-bot-greedy").classList.toggle("on", bot === "greedy");
-  $("#p-bot-random").classList.toggle("on", bot === "random");
-  $("#p-bot-greedy").textContent = bot === "greedy" ? "Stop the bot" : "Bot plays (greedy)";
-  $("#p-bot-random").textContent = bot === "random" ? "Stop the bot" : "Bot plays (random)";
-}
-$("#p-bot-greedy").onclick = () => setBot("greedy");
-$("#p-bot-random").onclick = () => setBot("random");
-
-function syncPanel() {
-  levelSel.value = String(S.levelIndex);
-  setRange("p-el", cam.baseEl, f0);
-  setRange("p-az", cam.baseAz, f0);
-  setRange("p-margin", cam.margin, (v) => v.toFixed(3));
-  setRange("p-zoom", cam.tZoom, f2);
-  setRange("p-refop", Number($("#p-refop").value), f2);
-  setRange("p-volume", sound.volume ?? 0.8, fPct);
-  for (const c of GRIME_CATS) setRange("p-dirt-" + c, GRIME[c].uDirt.value, f2);
-}
-function stateText() {
-  return `${S.level?.id ?? "—"} · ${S.phase} · ${S.placed}/${S.total}\n` +
-    `pile ${pileItems().length} · awake ${S.physics ? S.physics.awakeCount() : 0}\n` +
-    `tray: ${S.tray.map((t) => t.type).join(", ") || "—"}\n` +
-    `help: undo ${S.counts.undo} · magnifier ${S.counts.hint} · shuffle ${S.counts.shuffle}\n` +
-    `still messy: ${S.resolvers.filter((r) => !r.done).map((r) => r.part + "←" + r.by).join(", ") || "—"}`;
-}
-setInterval(() => {
-  if (panel.hidden) return;
-  $("#p-state").textContent = stateText();
-  if (document.activeElement?.type !== "range") { setRange("p-zoom", cam.tZoom, f2); for (const c of GRIME_CATS) setRange("p-dirt-" + c, GRIME[c].uDirt.value, f2); }
-}, 300);
-
-// Referans bindirmesi: bitmiş ya da başlangıç hâlinin anlık görüntüsü (kamera değişince yenilenir)
-const refImg = $("#ref-overlay");
-let refMode = "", refTimer = null;
-$("#p-ref").onchange = (e) => { refMode = e.target.value; refImg.hidden = !refMode; refImg.style.opacity = $("#p-refop").value; if (refMode) captureRef(); };
-function scheduleRef() { if (!refMode) return; clearTimeout(refTimer); refTimer = setTimeout(captureRef, 160); }
-function captureRef() {
-  if (!refMode || !S.level) return;
-  const save = { decor: [], rigs: {}, dirt: {}, items: [] };
-  for (const list of S.decor.values()) for (const d of list) save.decor.push([d, d.visible, d.scale.clone()]);
-  for (const [id, rig] of Object.entries(room.rigs)) save.rigs[id] = rig.t;
-  for (const c of GRIME_CATS) save.dirt[c] = [GRIME[c].uDirt.value, GRIME[c].uClean.value];
-  for (const it of S.items) save.items.push([it, it.obj.visible]);
-  const L = S.level;
-  if (refMode === "done") {
-    for (const list of S.decor.values()) for (const d of list) { d.visible = true; d.scale.copy(d.userData.baseScale); }
-    for (const rig of Object.values(room.rigs)) rig.set(1);
-    for (const c of GRIME_CATS) GRIME[c].uDirt.value = 0;
-    for (const it of S.items) it.obj.visible = false;
-  } else {
-    for (const t of L.types) for (const d of S.decor.get(t) || []) d.visible = false;
-    for (const [id, rig] of Object.entries(room.rigs)) rig.set(L.mess.includes(id) ? 0 : 1);
-    for (const c of GRIME_CATS) { GRIME[c].uDirt.value = L.dirt.includes(c) ? 1 : 0; GRIME[c].uClean.value = -0.3; }
-  }
-  renderer.render(scene, camera);
-  refImg.src = canvas.toDataURL("image/png");
-  for (const [d, vis, sc] of save.decor) { d.visible = vis; d.scale.copy(sc); }
-  for (const [id, t] of Object.entries(save.rigs)) room.rigs[id].set(t);
-  for (const c of GRIME_CATS) { GRIME[c].uDirt.value = save.dirt[c][0]; GRIME[c].uClean.value = save.dirt[c][1]; }
-  for (const [it, vis] of save.items) it.obj.visible = vis;
-}
+// Debug state that the removed settings panel used to toggle (kept off)
+const showColliders = false;
+let colliderLines = null;
+const fpsEl = null;
 
 // ── Dokunma: seç, döndür, kaydır, yakınlaştır ───────────────────────────────────────────
 const raycaster = new THREE.Raycaster();
@@ -1180,7 +912,6 @@ hitEl.addEventListener("pointermove", (e) => {
     // a drag across the whole width = one full turn (the reference's rate); the height stays in its range
     cam.tAz -= (dx / view.w) * 360;
     cam.tEl = THREE.MathUtils.clamp(cam.tEl + (dy / view.h) * 117, EL_MIN, EL_MAX);
-    if (Math.abs(wrapDeg(cam.tAz - cam.baseAz)) > 6) hideRotateHint();
   } else if (gesture.type === "pinch" && pointers.size >= 2) {
     const [a, b] = [...pointers.values()];
     const d = Math.hypot(a.x - b.x, a.y - b.y);
@@ -1213,9 +944,7 @@ document.addEventListener("keydown", (e) => {
   const k = e.key.toLowerCase();
   if (k === "r") goLevel(S.levelIndex);
   else if (k === "n") goLevel((S.levelIndex + 1) % LEVELS.length);
-  else if (k === "d") togglePanel();
   else if (k === "h") resetCamera();
-  else if (k === "escape") { closePanel(); $("#sheet").hidden = true; }
 });
 
 // ── Döngü ───────────────────────────────────────────────────────────────────────────────
@@ -1276,7 +1005,6 @@ function frame(now) {
   confetti.update(dt);
   updateGrime(dt);
   updateCamera(real);
-  if (camMoved) scheduleRef();
   updateTutorial();
   updateColliders();
   // pencere ışığında süzülen toz
@@ -1355,7 +1083,7 @@ window.__tidy = {
   },
   shapes: () => Object.fromEntries([...protos.values()].map((p) => [p.type, { round: p.shape.round, radius: p.radius, points: [...p.shape.points].map((v) => +v.toFixed(4)), raw: [...hullPoints((() => { const w = new THREE.Group(); const m = p.model.clone(); m.position.copy(p.center).negate(); w.add(m); return w; })(), 0.03, 600)].map((v) => +v.toFixed(4)) }])),
   winNow: () => { finishInstantly(); S.phase = "play"; S.startTime = S.now - 83; win(); },
-  autoStep, randomStep, finish: finishInstantly, load: loadLevel, go: goLevel, openPanel, zoomBy, aimAz, wallHidden, cam: () => ({ az: +cam.tAz.toFixed(1), el: +cam.tEl.toFixed(1), zoom: +cam.tZoom.toFixed(3), pan: cam.tPan.toArray() }),
+  autoStep, randomStep, finish: finishInstantly, load: loadLevel, go: goLevel, zoomBy, aimAz, wallHidden, cam: () => ({ az: +cam.tAz.toFixed(1), el: +cam.tEl.toFixed(1), zoom: +cam.tZoom.toFixed(3), pan: cam.tPan.toArray() }),
   pickType: (t) => pickItem(topFirst(pileItems().filter((p) => p.type === t))[0]),
   // the gameplay film (tools/film.mjs): taps a visible item the way a player would, records sounds, moves the camera
   film: {
@@ -1408,8 +1136,7 @@ async function boot() {
     setTimeout(() => { loading.classList.add("open"); sound.shutter(true); setTimeout(() => (loading.hidden = true), 900); }, 250);
     if (params.get("state") === "done") setTimeout(finishInstantly, 50);
     if (params.get("autoplay") === "1") setInterval(autoStep, Number(params.get("tick") || 520));
-    if (params.get("panel") === "1") setTimeout(openPanel, 400);
-    if (params.get("result")) setTimeout(() => showResult(params.get("result") === "won", { stars: 3, elapsed: 83, used: 0 }), 300);
+    if (params.get("result")) setTimeout(() => showResult(params.get("result") === "won", { stars: 3, elapsed: 83 }), 300);
   } catch (err) {
     console.error(err);
     $("#loading-message").textContent = "Could not start: " + (err && err.message ? err.message : err);

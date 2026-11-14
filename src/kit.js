@@ -56,6 +56,10 @@ export function getHighlightMat(base) {
   let m = hlCache.get(base);
   if (!m) {
     m = base.clone();
+    // keep shader patches (item colour boost, grime) that clone() drops
+    m.defines = { ...(base.defines || {}) };
+    m.onBeforeCompile = base.onBeforeCompile;
+    m.customProgramCacheKey = base.customProgramCacheKey;
     if (m.emissive) { m.emissive = new THREE.Color("#fff3c4"); m.emissiveIntensity = 0.32; }
     hlCache.set(base, m);
   }
